@@ -4,9 +4,9 @@ import time
 from typing import Optional, Literal
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from database import create_document, get_documents, db
@@ -82,16 +82,12 @@ def test_database():
 def _call_videotok_api(prompt: str, duration_sec: int, watermark: bool) -> Optional[dict]:
     api_key = os.getenv("VIDEOTOK_API_KEY") or "bfb75f7ee800432fba64205d1c09dc37"
     try:
-        # NOTE: The real VideoTok API spec isn't provided. This is a best-effort
-        # implementation that tries a plausible endpoint. If it fails, we fall back
-        # to a demo video so the app stays functional.
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         payload = {
             "prompt": prompt,
             "duration": duration_sec,
             "watermark": watermark,
         }
-        # Hypothetical endpoint — may fail; caught below
         resp = requests.post("https://api.videotok.ai/v1/generate", json=payload, headers=headers, timeout=10)
         if resp.status_code == 200:
             return resp.json()
@@ -119,7 +115,6 @@ def _build_prompt(req: VideoRequest) -> str:
 
 @app.post("/api/videos")
 def create_video(req: VideoRequest):
-    # Enforce plan constraints
     if req.plan == 'free' and req.duration_sec > 20:
         raise HTTPException(status_code=400, detail="Free plan allows up to 20 seconds only.")
 
@@ -129,10 +124,8 @@ def create_video(req: VideoRequest):
 
     prompt = _build_prompt(req)
 
-    # Save initial request
     request_id = create_document("videorequest", req.model_dump())
 
-    # Try calling VideoTok; fall back to demo
     api_result = _call_videotok_api(prompt, req.duration_sec, watermark)
 
     if api_result and api_result.get("video_url"):
@@ -140,12 +133,10 @@ def create_video(req: VideoRequest):
         thumbnail_url = api_result.get("thumbnail_url")
         status = "completed"
     else:
-        # Fallback demo content so the app is functional
-        # Use a small sample mp4
         video_url = "https://samplelib.com/lib/preview/mp4/sample-5s.mp4" if req.duration_sec <= 6 else "https://samplelib.com/lib/preview/mp4/sample-10s.mp4"
         thumbnail_url = "https://images.unsplash.com/photo-1525547719571-a2d4ac8945e2?w=600&q=60&auto=format&fit=crop"
         status = "completed"
-        time.sleep(0.3)  # tiny delay to simulate processing
+        time.sleep(0.3)
 
     record = VideoRecord(
         request_id=request_id,
@@ -166,7 +157,6 @@ def create_video(req: VideoRequest):
 def list_recent_videos(limit: int = 10):
     try:
         docs = get_documents("videorecord", limit=limit)
-        # Convert ObjectId to string in case
         for d in docs:
             if "_id" in d:
                 d["_id"] = str(d["_id"])
@@ -238,6 +228,52 @@ def get_plans():
             },
         ]
     }
+
+
+# -------- Resume upload (raw bytes, no multipart dependency) --------
+
+@app.post("/api/upload-resume")
+async def upload_resume(request: Request, filename: Optional[str] = Query(None)):
+    content_type = request.headers.get("content-type", "application/octet-stream").lower()
+    data = await request.body()
+
+    # Determine file type from filename or content-type
+    ext = (os.path.splitext(filename)[1].lower() if filename else "") if filename else ""
+    if not ext:
+        if "pdf" in content_type:
+            ext = ".pdf"
+        elif "wordprocessingml" in content_type or "docx" in content_type:
+            ext = ".docx"
+        elif "msword" in content_type:
+            ext = ".doc"
+
+    if ext == ".pdf":
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            texts = [(page.extract_text() or "") for page in reader.pages]
+            text = "\n".join(texts).strip()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read PDF: {str(e)[:120]}")
+    elif ext == ".docx":
+        try:
+            from docx import Document
+            doc = Document(io.BytesIO(data))
+            paras = [p.text for p in doc.paragraphs]
+            text = "\n".join([p for p in paras if p]).strip()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read DOCX: {str(e)[:120]}")
+    elif ext == ".doc":
+        raise HTTPException(status_code=415, detail=".doc is not supported here. Please upload PDF or DOCX.")
+    else:
+        raise HTTPException(status_code=415, detail="Unsupported file type. Please upload PDF or DOCX.")
+
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Could not extract text from file.")
+
+    MAX_LEN = 20000
+    return {"text": text[:MAX_LEN], "truncated": len(text) > MAX_LEN}
 
 
 if __name__ == "__main__":
